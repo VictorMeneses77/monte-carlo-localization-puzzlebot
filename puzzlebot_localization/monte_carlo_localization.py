@@ -85,7 +85,9 @@ class MonteCarloLocalization(Node):
         self.declare_parameter('motion_noise_theta', 0.02)
         self.declare_parameter('scan_subsample', 20)
         self.declare_parameter('resample_rate', 0.5)
-        self.declare_parameter('sigma_hit', 0.2)  # σ del modelo Gaussiano per-ray (m)
+        self.declare_parameter('sigma_hit', 0.25)  # σ del componente Gaussiano per-ray (m)
+        self.declare_parameter('z_hit', 0.9)       # peso del componente Gaussiano
+        self.declare_parameter('z_rand', 0.1)      # peso del componente uniforme (piso anti-outlier)
         self.declare_parameter('random_particles_rate', 0.02)  # tasa máxima (cuando la localización es mala)
         self.declare_parameter('random_particles_min_rate', 0.003)  # tasa mínima (cuando localiza bien)
         self.declare_parameter('weight_threshold_good', 0.5)  # peso promedio que se considera "bien localizado"
@@ -101,6 +103,8 @@ class MonteCarloLocalization(Node):
         self.scan_subsample = self.get_parameter('scan_subsample').get_parameter_value().integer_value
         self.resample_rate = self.get_parameter('resample_rate').get_parameter_value().double_value
         self.sigma_hit = self.get_parameter('sigma_hit').get_parameter_value().double_value
+        self.z_hit = self.get_parameter('z_hit').get_parameter_value().double_value
+        self.z_rand = self.get_parameter('z_rand').get_parameter_value().double_value
         self.random_particles_rate_max = self.get_parameter('random_particles_rate').get_parameter_value().double_value
         self.random_particles_rate_min = self.get_parameter('random_particles_min_rate').get_parameter_value().double_value
         self.weight_thr_good = self.get_parameter('weight_threshold_good').get_parameter_value().double_value
@@ -245,10 +249,11 @@ class MonteCarloLocalization(Node):
                 p.weight = 1e-6
 
     def compute_weights(self):
-        """Paso E: likelihood Gaussiano per-ray (Beam Model, Thrun cap. 6).
-        Para cada rayo:  P(r_real | pose) = N(r_real; r_esperado, σ²)
-        Likelihood total = ∏ᵢ P(rᵢ).  Se calcula en log-space y se normaliza
-        restando el max log-likelihood antes de exp para evitar underflow.
+        """Paso E: Beam Model con mezcla Gaussiano + uniforme (Thrun cap. 6.3).
+            P(r_real | pose) = z_hit · N(r_real; r_esperado, σ²) + z_rand · 1/r_max
+        El término uniforme actúa como PISO ANTI-OUTLIER: un rayo malo aporta
+        al menos z_rand/r_max al likelihood, evitando que mate la pose entera.
+        Se acumula en log-space con max-shift para evitar underflow.
         """
         if self.latest_scan is None:
             return
@@ -261,6 +266,10 @@ class MonteCarloLocalization(Node):
 
         sigma_hit = self.sigma_hit
         inv_2sigma2 = 1.0 / (2.0 * sigma_hit * sigma_hit)
+        hit_norm = 1.0 / math.sqrt(2.0 * math.pi * sigma_hit * sigma_hit)
+        rand_density = 1.0 / scan.range_max
+        z_hit = self.z_hit
+        z_rand = self.z_rand
 
         log_likelihoods = np.full(len(self.particles), -np.inf, dtype=np.float64)
         in_wall = np.zeros(len(self.particles), dtype=bool)
@@ -279,7 +288,7 @@ class MonteCarloLocalization(Node):
 
                 angle = normalize_angle(p.theta + angles[idx])
 
-                # Raycasting
+                # Raycasting hasta encontrar obstáculo o salir del mapa
                 r_expected = scan.range_max
                 step_size = self.map_loader.resolution
                 d = step_size
@@ -296,7 +305,9 @@ class MonteCarloLocalization(Node):
                     d += step_size
 
                 err = r_real - r_expected
-                log_l += -(err * err) * inv_2sigma2
+                p_hit = hit_norm * math.exp(-(err * err) * inv_2sigma2)
+                p_ray = z_hit * p_hit + z_rand * rand_density
+                log_l += math.log(p_ray)
                 valid_rays += 1
 
             if valid_rays > 0:
@@ -306,7 +317,7 @@ class MonteCarloLocalization(Node):
         max_log = log_likelihoods[~np.isinf(log_likelihoods)].max() if (~np.isinf(log_likelihoods)).any() else 0.0
         for i, p in enumerate(self.particles):
             if in_wall[i] or np.isinf(log_likelihoods[i]):
-                p.weight = 1e-9   # mínimo no-cero, sigue siendo elegible en resample
+                p.weight = 1e-9
             else:
                 p.weight = math.exp(log_likelihoods[i] - max_log)
 

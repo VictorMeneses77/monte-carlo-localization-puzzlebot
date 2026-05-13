@@ -34,8 +34,9 @@ La **Localización de Monte Carlo** (también llamada *Particle Filter Localizat
 
 Este paquete implementa el algoritmo completo con las siguientes características:
 - **Modelo de movimiento de dos rotaciones** (rot1 + traslación + rot2) para mayor precisión.
-- **Beam Model probabilístico** (Thrun Cap. 6): likelihood gaussiano per-ray calculado en log-space con max-shift para evitar underflow.
+- **Beam Model con mezcla Gaussiano + uniforme** (Thrun Cap. 6.3, componentes p_hit + p_rand): robusto a outliers por discretización del mapa o ruido del sensor.
 - **Raycasting** sobre el mapa occupancy para calcular rangos esperados.
+- **Log-space con max-shift** para evitar underflow numérico con muchos rayos.
 - **Resampleo adaptativo** con tasa variable de partículas aleatorias (recuperación ante secuestro).
 - **Media circular ponderada** para estimar el ángulo sin discontinuidad en ±π.
 
@@ -226,45 +227,47 @@ Si la partícula cae en una celda ocupada tras el movimiento, su peso se reduce 
 
 ---
 
-### Fase E — Corrección por LiDAR (Beam Model probabilístico)
+### Fase E — Corrección por LiDAR (Beam Model con mezcla)
 
 **Método:** `compute_weights()`
 
-Se implementa el **Beam Model** de Thrun (Probabilistic Robotics, Cap. 6): cada rayo del LiDAR aporta independientemente al likelihood de la pose de la partícula bajo un modelo gaussiano.
+Se implementa el **Beam Model de Thrun** (Probabilistic Robotics, Cap. 6.3) con los dos componentes más importantes: `p_hit` (Gaussiano) y `p_rand` (uniforme). Los otros dos del libro (`p_short` para obstáculos imprevistos y `p_max` para fallos del sensor) no son necesarios en simulación con LiDAR ideal.
 
 #### 1. Submuestreo del scan
-De los ~360 rayos del LiDAR se toman cada `scan_subsample` rayos (default cada 20, es decir 18 rayos) para reducir el costo computacional.
+De los ~360 rayos del LiDAR se toman cada `scan_subsample` rayos (default cada 20, es decir ~18 rayos) para reducir el costo computacional.
 
 #### 2. Raycasting sintético
 Para cada rayo seleccionado, se lanza un rayo desde la posición de la partícula en la dirección `p.theta + angle_rayo`. Se avanza de celda en celda (paso = `resolution = 0.05 m`) hasta encontrar una celda ocupada o salir del mapa. La distancia recorrida es `r_expected`.
 
-#### 3. Log-likelihood gaussiano por rayo
-Bajo el Beam Model, la probabilidad de observar `r_real` dado que el rango esperado es `r_expected` es:
+#### 3. Likelihood por rayo — modelo de mezcla
+
+Cada rayo aporta al likelihood de la pose con la siguiente mezcla:
 
 ```
-P(r_real | pose) = N(r_real; r_expected, σ²)
+P(r_real | pose) = z_hit · N(r_real; r_expected, σ_hit²)  +  z_rand · (1 / r_max)
 ```
 
-En lugar de multiplicar probabilidades (que converge a cero con muchos rayos), se acumula en **log-space**:
+- **Componente `z_hit · N(...)`** — discrimina entre poses: un rayo que coincide con el mapa aporta mucho, uno que no coincide aporta poco.
+- **Componente `z_rand · (1/r_max)`** — piso constante anti-outlier: garantiza que ningún rayo pueda anular completamente el likelihood de una partícula, sin importar cuánto difiera. Esto modela mediciones atípicas por discretización del mapa, diferencias Gazebo/mapa real, etc.
 
+**Por qué importa la mezcla:** con el Beam Model gaussiano puro, 2 rayos malos (error > 2σ) pueden reducir el ratio pose_correcta/pose_incorrecta de 10⁷ a apenas 25×, margen demasiado frágil para sobrevivir al resampleo. Con la mezcla, el mismo escenario mantiene un ratio de ~200,000×.
+
+Parámetros: `z_hit = 0.9`, `z_rand = 0.1`, `sigma_hit = 0.25 m`.
+
+#### 4. Acumulación en log-space
+Los rayos son independientes, por lo que el likelihood total es el producto:
 ```
-log_l += −(r_real − r_expected)² / (2σ²)
+log P(scan | pose) = Σᵢ log P(rᵢ | pose)  =  Σᵢ log(z_hit · p_hit_i + z_rand · rand_density)
 ```
+Se acumula directamente `log(p_ray)` para cada rayo válido. Usar log evita el underflow numérico que ocurriría al multiplicar decenas de probabilidades pequeñas.
 
-Esto es numéricamente equivalente a `log P(scan | pose) = Σ log P(rᵢ | pose)`, aprovechando que los rayos son independientes. El parámetro `sigma_hit = 0.2 m` controla la tolerancia: un rayo que difiera en 1σ contribuye con factor `exp(−0.5)`, en 2σ con `exp(−2)`, etc.
-
-#### 4. Normalización con max-shift (evita underflow)
-Con muchos rayos, `log_l` puede ser muy negativo y `exp(log_l)` se va a cero. Se aplica el truco estándar de **restar el máximo** antes de exponenciar:
-
+#### 5. Normalización con max-shift
+Antes de convertir de log a peso lineal, se resta el máximo log-likelihood entre todas las partículas:
 ```
 max_log = max(log_likelihoods)
 p.weight = exp(log_l − max_log)
 ```
-
-Esto preserva las proporciones relativas entre partículas sin underflow numérico. La partícula con mejor ajuste siempre tiene `weight = 1.0`; las demás quedan en `(0, 1]`.
-
-#### Por qué se eliminó el anclaje a odometría (`score_odom`)
-La versión anterior multiplicaba el score del scan por un término gaussiano centrado en la odometría para evitar "teletransporte". Esto era **doble-conteo**: la odometría ya alimenta el modelo de movimiento (Fase G). Añadirla también en el sensor model sesga el filtro hacia el drift acumulado del odom, reduciendo la capacidad correctiva del LiDAR. Con el Beam Model probabilístico correcto, el sensor model solo depende de las observaciones y el mapa.
+Esto preserva las proporciones relativas sin underflow. La partícula con mejor ajuste siempre obtiene `weight = 1.0`; las demás quedan en `(0, 1]`.
 
 ---
 
@@ -380,7 +383,9 @@ Todos los parámetros se declaran y pueden sobreescribirse desde el launch file 
 | `motion_noise_theta` | `0.05` | Ruido gaussiano en rotación (rad) |
 | `scan_subsample` | `20` | Tomar 1 de cada N rayos del scan |
 | `resample_rate` | `0.5` | (Reservado para uso futuro) |
-| `sigma_hit` | `0.2` | Desviación estándar del modelo gaussiano por rayo (m) |
+| `sigma_hit` | `0.25` | Desviación estándar del componente gaussiano por rayo (m) |
+| `z_hit` | `0.9` | Peso del componente gaussiano en la mezcla |
+| `z_rand` | `0.1` | Peso del componente uniforme (piso anti-outlier) |
 | `random_particles_rate` | `0.02` | Tasa máxima de partículas aleatorias (perdido) |
 | `random_particles_min_rate` | `0.003` | Tasa mínima de partículas aleatorias (localizado) |
 | `weight_threshold_good` | `0.5` | Umbral de peso promedio para "bien localizado" |
