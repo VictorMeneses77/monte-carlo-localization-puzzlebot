@@ -32,13 +32,12 @@ Localización autónoma de un robot diferencial **Puzzlebot** (Manchester Roboti
 
 La **Localización de Monte Carlo** (también llamada *Particle Filter Localization*) es un algoritmo probabilístico que estima la pose del robot dentro de un mapa conocido. En lugar de mantener una distribución de probabilidad cerrada, usa un conjunto de **partículas** (hipótesis de pose) que evolucionan con el movimiento y se ponderan con las observaciones del sensor. Con el tiempo, las partículas convergen hacia la pose real del robot.
 
-Este paquete implementa el algoritmo completo con las siguientes mejoras:
+Este paquete implementa el algoritmo completo con las siguientes características:
 - **Modelo de movimiento de dos rotaciones** (rot1 + traslación + rot2) para mayor precisión.
-- **Raycasting** sobre el mapa occupancy para el modelo de sensor.
-- **Anclaje suave a odometría** para evitar "teletransporte" en zonas ambiguas.
+- **Beam Model probabilístico** (Thrun Cap. 6): likelihood gaussiano per-ray calculado en log-space con max-shift para evitar underflow.
+- **Raycasting** sobre el mapa occupancy para calcular rangos esperados.
 - **Resampleo adaptativo** con tasa variable de partículas aleatorias (recuperación ante secuestro).
 - **Media circular ponderada** para estimar el ángulo sin discontinuidad en ±π.
-- **Detector de saltos imposibles** que fuerza reinicialización cuando la nube se dispersa.
 
 ---
 
@@ -227,11 +226,11 @@ Si la partícula cae en una celda ocupada tras el movimiento, su peso se reduce 
 
 ---
 
-### Fase E — Corrección por LiDAR (Sensor Model)
+### Fase E — Corrección por LiDAR (Beam Model probabilístico)
 
 **Método:** `compute_weights()`
 
-Para cada partícula se evalúa qué tan bien explicaría el scan observado si el robot estuviese en esa pose. El proceso es:
+Se implementa el **Beam Model** de Thrun (Probabilistic Robotics, Cap. 6): cada rayo del LiDAR aporta independientemente al likelihood de la pose de la partícula bajo un modelo gaussiano.
 
 #### 1. Submuestreo del scan
 De los ~360 rayos del LiDAR se toman cada `scan_subsample` rayos (default cada 20, es decir 18 rayos) para reducir el costo computacional.
@@ -239,25 +238,33 @@ De los ~360 rayos del LiDAR se toman cada `scan_subsample` rayos (default cada 2
 #### 2. Raycasting sintético
 Para cada rayo seleccionado, se lanza un rayo desde la posición de la partícula en la dirección `p.theta + angle_rayo`. Se avanza de celda en celda (paso = `resolution = 0.05 m`) hasta encontrar una celda ocupada o salir del mapa. La distancia recorrida es `r_expected`.
 
-#### 3. Puntuación por diferencia de rangos
-```
-avg_diff = mean(|r_expected − r_real|)  para todos los rayos válidos
-score_scan = 1 / (1 + avg_diff)
-```
-Un `avg_diff = 0` da `score_scan = 1.0` (perfecto). Un `avg_diff = 1 m` da `score_scan = 0.5`.
-
-#### 4. Anclaje suave a odometría
-Para evitar que el filtro "teletransporte" la nube a zonas del mapa con geometría similar (paredes paralelas, simetría), se penaliza partículas demasiado alejadas de la posición de la odometría:
+#### 3. Log-likelihood gaussiano por rayo
+Bajo el Beam Model, la probabilidad de observar `r_real` dado que el rango esperado es `r_expected` es:
 
 ```
-dist = √((p.x − odom_x)² + (p.y − odom_y)²)
-score_odom = exp(−dist² / (2 × σ_odom²))    σ_odom = 1.0 m
+P(r_real | pose) = N(r_real; r_expected, σ²)
 ```
 
-#### 5. Peso final
+En lugar de multiplicar probabilidades (que converge a cero con muchos rayos), se acumula en **log-space**:
+
 ```
-p.weight = score_scan × score_odom
+log_l += −(r_real − r_expected)² / (2σ²)
 ```
+
+Esto es numéricamente equivalente a `log P(scan | pose) = Σ log P(rᵢ | pose)`, aprovechando que los rayos son independientes. El parámetro `sigma_hit = 0.2 m` controla la tolerancia: un rayo que difiera en 1σ contribuye con factor `exp(−0.5)`, en 2σ con `exp(−2)`, etc.
+
+#### 4. Normalización con max-shift (evita underflow)
+Con muchos rayos, `log_l` puede ser muy negativo y `exp(log_l)` se va a cero. Se aplica el truco estándar de **restar el máximo** antes de exponenciar:
+
+```
+max_log = max(log_likelihoods)
+p.weight = exp(log_l − max_log)
+```
+
+Esto preserva las proporciones relativas entre partículas sin underflow numérico. La partícula con mejor ajuste siempre tiene `weight = 1.0`; las demás quedan en `(0, 1]`.
+
+#### Por qué se eliminó el anclaje a odometría (`score_odom`)
+La versión anterior multiplicaba el score del scan por un término gaussiano centrado en la odometría para evitar "teletransporte". Esto era **doble-conteo**: la odometría ya alimenta el modelo de movimiento (Fase G). Añadirla también en el sensor model sesga el filtro hacia el drift acumulado del odom, reduciendo la capacidad correctiva del LiDAR. Con el Beam Model probabilístico correcto, el sensor model solo depende de las observaciones y el mapa.
 
 ---
 
@@ -328,22 +335,6 @@ donde `T_map_base` es la pose estimada y `T_odom_base` es la pose de la odometr�
 
 ---
 
-### Detector de saltos imposibles
-
-Después de cada estimación se verifica que el cambio de pose del MCL no sea físicamente imposible dado el movimiento de la odometría:
-
-```python
-max_step = max(max_jump_min, max_jump_factor × odom_step)
-if est_step > max_step:
-    _reinit_around_odom()
-```
-
-Parámetros:
-- `max_jump_factor = 5.0` — el MCL puede moverse hasta 5× más que el odom en un paso
-- `max_jump_min = 0.3 m` — tolerancia mínima absoluta
-
-Cuando el filtro "teletransporta" (salta a otra zona del mapa con geometría similar), este detector lo detecta y fuerza una reinicialización alrededor de la odometría.
-
 ---
 
 ## Nodos auxiliares
@@ -389,15 +380,14 @@ Todos los parámetros se declaran y pueden sobreescribirse desde el launch file 
 | `motion_noise_theta` | `0.05` | Ruido gaussiano en rotación (rad) |
 | `scan_subsample` | `20` | Tomar 1 de cada N rayos del scan |
 | `resample_rate` | `0.5` | (Reservado para uso futuro) |
-| `random_particles_rate` | `0.05` | Tasa máxima de partículas aleatorias (perdido) |
+| `sigma_hit` | `0.2` | Desviación estándar del modelo gaussiano por rayo (m) |
+| `random_particles_rate` | `0.02` | Tasa máxima de partículas aleatorias (perdido) |
 | `random_particles_min_rate` | `0.003` | Tasa mínima de partículas aleatorias (localizado) |
 | `weight_threshold_good` | `0.5` | Umbral de peso promedio para "bien localizado" |
 | `weight_threshold_bad` | `0.1` | Umbral de peso promedio para "perdido" |
 | `weight_ema_alpha` | `0.3` | Factor de suavizado EMA del peso promedio |
 | `initial_pose` | `[0.0, 0.0, 0.0]` | Pose inicial `[x, y, θ]` en metros/rad |
 | `initial_pose_std` | `[1.0, 1.0, 1.0]` | Desviación estándar de la inicialización |
-| `max_jump_factor` | `5.0` | Factor máximo de salto MCL vs odom |
-| `max_jump_min` | `0.3` | Tolerancia mínima de salto (m) |
 
 ---
 

@@ -85,7 +85,8 @@ class MonteCarloLocalization(Node):
         self.declare_parameter('motion_noise_theta', 0.02)
         self.declare_parameter('scan_subsample', 20)
         self.declare_parameter('resample_rate', 0.5)
-        self.declare_parameter('random_particles_rate', 0.05)  # tasa máxima (cuando la localización es mala)
+        self.declare_parameter('sigma_hit', 0.2)  # σ del modelo Gaussiano per-ray (m)
+        self.declare_parameter('random_particles_rate', 0.02)  # tasa máxima (cuando la localización es mala)
         self.declare_parameter('random_particles_min_rate', 0.003)  # tasa mínima (cuando localiza bien)
         self.declare_parameter('weight_threshold_good', 0.5)  # peso promedio que se considera "bien localizado"
         self.declare_parameter('weight_threshold_bad', 0.1)   # peso promedio que se considera "perdido"
@@ -99,6 +100,7 @@ class MonteCarloLocalization(Node):
         self.motion_noise_theta = self.get_parameter('motion_noise_theta').get_parameter_value().double_value
         self.scan_subsample = self.get_parameter('scan_subsample').get_parameter_value().integer_value
         self.resample_rate = self.get_parameter('resample_rate').get_parameter_value().double_value
+        self.sigma_hit = self.get_parameter('sigma_hit').get_parameter_value().double_value
         self.random_particles_rate_max = self.get_parameter('random_particles_rate').get_parameter_value().double_value
         self.random_particles_rate_min = self.get_parameter('random_particles_min_rate').get_parameter_value().double_value
         self.weight_thr_good = self.get_parameter('weight_threshold_good').get_parameter_value().double_value
@@ -134,11 +136,6 @@ class MonteCarloLocalization(Node):
         self.current_odom = None
         self.initialized = False
         self.iteration_count = 0
-        self.prev_est = None  # (x, y, theta) anterior para detector de saltos
-        self.declare_parameter('max_jump_factor', 5.0)  # MCL puede saltar hasta N× el delta del odom
-        self.declare_parameter('max_jump_min', 0.3)     # tolerancia mínima absoluta en metros
-        self.max_jump_factor = self.get_parameter('max_jump_factor').get_parameter_value().double_value
-        self.max_jump_min = self.get_parameter('max_jump_min').get_parameter_value().double_value
 
         self.init_particles()
         self.publish_map()
@@ -248,10 +245,12 @@ class MonteCarloLocalization(Node):
                 p.weight = 1e-6
 
     def compute_weights(self):
-        """Paso E: score basado en coincidencia de distancias de rayos + anclaje suave a odometría.
-        El anclaje evita que el error de cuantización del raycasting arrastre la nube lejos.
+        """Paso E: likelihood Gaussiano per-ray (Beam Model, Thrun cap. 6).
+        Para cada rayo:  P(r_real | pose) = N(r_real; r_esperado, σ²)
+        Likelihood total = ∏ᵢ P(rᵢ).  Se calcula en log-space y se normaliza
+        restando el max log-likelihood antes de exp para evitar underflow.
         """
-        if self.latest_scan is None or self.current_odom is None:
+        if self.latest_scan is None:
             return
 
         scan = self.latest_scan
@@ -260,16 +259,19 @@ class MonteCarloLocalization(Node):
         step = max(1, self.scan_subsample)
         indices = np.arange(0, len(ranges), step)
 
-        odom_x, odom_y, odom_theta = pose_to_xytheta(self.current_odom.pose.pose)
-        sigma_odom = 1.0  # anclaje moderado: evita "teletransporte" cerca de zonas ambiguas (paredes)
+        sigma_hit = self.sigma_hit
+        inv_2sigma2 = 1.0 / (2.0 * sigma_hit * sigma_hit)
 
-        for p in self.particles:
-            if p.weight < 1e-9:
+        log_likelihoods = np.full(len(self.particles), -np.inf, dtype=np.float64)
+        in_wall = np.zeros(len(self.particles), dtype=bool)
+
+        for i, p in enumerate(self.particles):
+            if not self.map_loader.is_free(p.x, p.y):
+                in_wall[i] = True
                 continue
 
-            total_diff = 0.0
+            log_l = 0.0
             valid_rays = 0
-
             for idx in indices:
                 r_real = ranges[idx]
                 if math.isinf(r_real) or math.isnan(r_real) or r_real < scan.range_min or r_real > scan.range_max:
@@ -277,36 +279,36 @@ class MonteCarloLocalization(Node):
 
                 angle = normalize_angle(p.theta + angles[idx])
 
-                # Raycasting para obtener rango ESPERADO
+                # Raycasting
                 r_expected = scan.range_max
                 step_size = self.map_loader.resolution
                 d = step_size
                 while d <= scan.range_max:
-                    rx_exp = p.x + d * math.cos(angle)
-                    ry_exp = p.y + d * math.sin(angle)
-                    row_exp, col_exp = self.map_loader.world_to_map(rx_exp, ry_exp)
-                    if row_exp < 0 or row_exp >= self.map_loader.height or col_exp < 0 or col_exp >= self.map_loader.width:
+                    rx = p.x + d * math.cos(angle)
+                    ry = p.y + d * math.sin(angle)
+                    row, col = self.map_loader.world_to_map(rx, ry)
+                    if row < 0 or row >= self.map_loader.height or col < 0 or col >= self.map_loader.width:
                         r_expected = d
                         break
-                    if self.map_loader.occupancy[row_exp, col_exp] == 100:
+                    if self.map_loader.occupancy[row, col] == 100:
                         r_expected = d
                         break
                     d += step_size
 
-                total_diff += abs(r_expected - r_real)
+                err = r_real - r_expected
+                log_l += -(err * err) * inv_2sigma2
                 valid_rays += 1
 
             if valid_rays > 0:
-                avg_diff = total_diff / valid_rays
-                score_scan = 1.0 / (1.0 + avg_diff)
+                log_likelihoods[i] = log_l
+
+        # Normalizar exponenciando con max-shift para evitar underflow
+        max_log = log_likelihoods[~np.isinf(log_likelihoods)].max() if (~np.isinf(log_likelihoods)).any() else 0.0
+        for i, p in enumerate(self.particles):
+            if in_wall[i] or np.isinf(log_likelihoods[i]):
+                p.weight = 1e-9   # mínimo no-cero, sigue siendo elegible en resample
             else:
-                score_scan = 0.0
-
-            # Anclaje suave a odometría: penaliza partículas muy lejanas de la odometría
-            dist_to_odom = math.hypot(p.x - odom_x, p.y - odom_y)
-            score_odom = math.exp(-(dist_to_odom ** 2) / (2 * sigma_odom ** 2))
-
-            p.weight = score_scan * score_odom
+                p.weight = math.exp(log_likelihoods[i] - max_log)
 
     def resample(self):
         """Paso F: low-variance resampling (systematic resampling).
@@ -514,22 +516,6 @@ class MonteCarloLocalization(Node):
 
         # H. Estimación de pose
         est_x, est_y, est_theta = self.estimate_pose()
-
-        # Detector de salto imposible: si la estimación se mueve mucho más
-        # que el odom, es porque el filtro "teletransportó" a otra zona ambigua.
-        # Forzar reinit alrededor del odom para recuperarse.
-        if self.prev_est is not None:
-            est_step = math.hypot(est_x - self.prev_est[0], est_y - self.prev_est[1])
-            odom_step = math.hypot(dx, dy)
-            max_step = max(self.max_jump_min, self.max_jump_factor * odom_step)
-            if est_step > max_step:
-                self.get_logger().warn(
-                    f'Salto detectado: MCL={est_step:.2f} m vs odom={odom_step:.3f} m. Forzando reinit.'
-                )
-                self._reinit_around_odom()
-                est_x, est_y, est_theta = self.estimate_pose()
-
-        self.prev_est = (est_x, est_y, est_theta)
 
         # Publicaciones
         self.publish_particles()
